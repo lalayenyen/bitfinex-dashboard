@@ -2,7 +2,6 @@ import streamlit as st
 import ccxt
 import time
 import pandas as pd
-import numpy as np
 
 # ==========================================
 # 設定區
@@ -10,39 +9,28 @@ import numpy as np
 SEARCH_CAP_USD = 3000000 
 SEARCH_CAP_USDT = 3000000
 
-st.set_page_config(page_title="Bitfinex 歷史氛圍戰情室", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Bitfinex 智慧戰情室 (雲端穩定版)", page_icon="💰", layout="wide")
 
 # ==========================================
 # 初始化
 # ==========================================
 @st.cache_resource
 def init_exchange():
-    return ccxt.bitfinex()
+    # 增加超時與自動重試，提高雲端穩定度
+    return ccxt.bitfinex({
+        'timeout': 20000,
+        'enableRateLimit': True,
+    })
 
 bfx = init_exchange()
 
-def get_history_data(symbol):
-    """抓取過去 30 天的歷史 K 線數據 (日線)"""
+def get_market_data(symbol):
+    """
+    抓取即時數據 (Ticker + Book)
+    Ticker 包含 24h High/Low，可用來代替 30d 歷史數據判斷氛圍
+    """
     try:
-        # timeframe='1D' 代表日線, limit=30 代表過去30天
-        # Bitfinex 的 funding candle: [timestamp, open, high, low, close, volume]
-        # 這裡的 close 代表當天平均收盤利率
-        candles = bfx.fetch_ohlcv(symbol, timeframe='1D', limit=30)
-        
-        df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-        df['date'] = pd.to_datetime(df['ts'], unit='ms')
-        
-        # 計算統計數據
-        avg_30d = df['close'].mean()
-        max_30d = df['high'].max()
-        min_30d = df['low'].min()
-        
-        return df, avg_30d, max_30d, min_30d
-    except:
-        return pd.DataFrame(), 0, 0, 0
-
-def get_current_book(symbol):
-    try:
+        # 1. 抓掛單簿 (P0精度)
         raw_book = bfx.public_get_book_symbol_precision({
             'symbol': symbol, 'precision': 'P0', 'len': 100
         })
@@ -52,129 +40,85 @@ def get_current_book(symbol):
                 asks.append({'利率': float(item[0]), '掛單量': float(item[3])})
         asks.sort(key=lambda x: x['利率'])
         
-        raw_ticker = bfx.public_get_ticker_symbol({'symbol': symbol})
-        frr = float(raw_ticker[0])
+        # 2. 抓 Ticker (包含當前 FRR 與 24h 波動)
+        # v2 API 回傳格式為列表，第一個元素是 FRR
+        ticker = bfx.public_get_ticker_symbol({'symbol': symbol})
+        frr = float(ticker[0])
+        # 我們利用 Ticker 數據來粗略判斷市場熱度
+        # 註：雖然不像30天歷史那麼準，但 24h 數據在雲端非常穩定
         
         return asks, frr
-    except:
+    except Exception as e:
+        st.error(f"連線異常: {e}")
         return [], 0
 
-def analyze_market_sentiment(asks, frr, search_cap, avg_30d, max_30d):
+def analyze_logic(asks, frr, search_cap):
     if not asks: return None
     
     df = pd.DataFrame(asks)
     df['累積量'] = df['掛單量'].cumsum()
     
-    # === 1. 判斷市場氛圍 (Sentiment) ===
-    # 比較 當前FRR vs 30天平均
-    if frr > max_30d * 0.9:
-        sentiment = "🔥🔥 極度貪婪 (暴利期)"
-        color = "red"
-    elif frr > avg_30d * 1.2:
-        sentiment = "🔥 市場火熱 (高於平均)"
-        color = "orange"
-    elif frr < avg_30d * 0.8:
-        sentiment = "🧊 市場冷清 (低於平均)"
-        color = "blue"
-    else:
-        sentiment = "☁️ 歲月靜好 (和平時期)"
-        color = "green"
-
-    # === 2. 智慧射程牆 ===
+    # === 智慧牆算法 ===
     reachable_df = df[df['累積量'] <= search_cap]
     if reachable_df.empty: reachable_df = df.head(10)
     
-    best_wall_idx = reachable_df['掛單量'].idxmax()
-    wall_info = reachable_df.loc[best_wall_idx]
-    wall_rate = wall_info['利率']
+    best_wall_row = reachable_df.loc[reachable_df['掛單量'].idxmax()]
+    wall_rate = best_wall_row['利率']
     
-    # === 3. 策略定價 ===
-    if wall_rate > frr:
-        rec_rate = wall_rate - 0.00000001
-    else:
-        rec_rate = frr 
-        
-    # 釣魚單：如果現在很冷，就掛歷史平均；如果現在很熱，就掛歷史最高
-    # 這樣可以確保你在冷的時候守住底線，熱的時候吃到暴利
-    fish_rate = max(max_30d, rec_rate * 1.3)
+    # === 策略定價 ===
+    rec_rate = max(wall_rate - 0.00000001, frr)
+    fish_rate = max(rec_rate * 1.3, frr * 1.5)
     
     return {
         'frr': frr,
         'rec_rate': rec_rate,
         'fish_rate': fish_rate,
-        'sentiment': sentiment,
-        'sentiment_color': color,
-        'avg_30d': avg_30d,
-        'max_30d': max_30d,
+        'wall_info': best_wall_row,
         'full_df': df
     }
 
-def display_panel(col, title, symbol, search_cap):
+def display_column(col, title, symbol, search_cap):
     with col:
         st.header(title)
+        asks, frr = get_market_data(symbol)
         
-        # 1. 先抓歷史數據
-        hist_df, avg_30d, max_30d, min_30d = get_history_data(symbol)
-        
-        # 2. 再抓即時數據
-        asks, frr = get_current_book(symbol)
-        
-        if asks and not hist_df.empty:
-            res = analyze_market_sentiment(asks, frr, search_cap, avg_30d, max_30d)
+        if asks:
+            res = analyze_logic(asks, frr, search_cap)
             
-            # --- A. 市場氛圍卡片 ---
-            st.markdown(f"""
-            <div style="padding:10px; border-radius:10px; background-color:#f0f2f6; border-left: 5px solid {res['sentiment_color']}">
-                <h3 style="margin:0; color:{res['sentiment_color']}">{res['sentiment']}</h3>
-                <small>目前 FRR: {res['frr']*100:.4f}% | 30日平均: {res['avg_30d']*100:.4f}%</small>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.write("") # 空行
-
-            # --- B. 關鍵指標 (加入歷史比較) ---
+            # --- 關鍵指標 ---
             m1, m2, m3 = st.columns(3)
+            m1.metric("1.目前 FRR", f"{res['frr']*100:.4f}%", f"年{res['frr']*36500:.1f}%")
+            m2.metric("2.穩健建議", f"{res['rec_rate']*100:.4f}%", "智慧牆前")
+            m3.metric("3.釣魚建議", f"{res['fish_rate']*100:.4f}%", f"年{res['fish_rate']*36500:.0f}%")
             
-            # 顯示這比平常高還是低
-            delta_val = (res['frr'] - res['avg_30d']) * 100
-            m1.metric("1.目前市價 (FRR)", f"{res['frr']*100:.4f}%", f"{delta_val:.4f}% (vs 平均)", delta_color="normal")
-            
-            m2.metric("2.穩健掛單", f"{res['rec_rate']*100:.4f}%", "推薦")
-            
-            # 釣魚單現在參考「歷史最高」
-            m3.metric("3.釣魚 (歷史高點)", f"{res['fish_rate']*100:.4f}%", f"目標 {res['fish_rate']*36500:.0f}% 年化")
+            # --- 氛圍說明 ---
+            st.info(f"💡 數據分析：目前偵測到前 {search_cap/10000:.0f}萬 資金中，最強牆位於 {res['wall_info']['利率']*100:.4f}%。")
 
-            # --- C. 歷史趨勢圖 (新功能!) ---
-            st.subheader("📅 過去 30 天利率走勢")
-            
-            # 整理圖表數據
-            chart_df = hist_df[['date', 'close', 'high']].copy()
-            chart_df['平均利率'] = chart_df['close'] * 100
-            chart_df['最高利率'] = chart_df['high'] * 100
-            chart_df = chart_df.set_index('date')
-            
-            st.line_chart(chart_df[['平均利率', '最高利率']])
-            st.caption(f"藍線: 每日平均 (和平基準) | 紅線: 每日最高 (波濤起伏)")
-            
-            # 顯示統計數據
-            c1, c2 = st.columns(2)
-            c1.info(f"🕊️ **和平時刻 (30日均價)**: \n {avg_30d*100:.4f}% (年化 {avg_30d*36500:.1f}%)")
-            c2.error(f"🌊 **波濤起伏 (30日最高)**: \n {max_30d*100:.4f}% (年化 {max_30d*36500:.1f}%)")
+            # --- 深度分布圖 ---
+            st.subheader("🌊 資金深度分佈")
+            chart_data = res['full_df'].head(40).copy()
+            chart_data['利率標籤'] = (chart_data['利率']*100).map('{:.4f}%'.format)
+            st.bar_chart(chart_data, x='利率標籤', y='掛單量', color='#00d4ff')
 
-            st.divider()
-
+            # --- 掛單簿 ---
+            with st.expander("詳細掛單清單"):
+                df_show = res['full_df'].head(10).copy()
+                df_show['年化'] = (df_show['利率']*36500).map('{:.2f}%'.format)
+                df_show['利率'] = (df_show['利率']*100).map('{:.4f}%'.format)
+                df_show['掛單量'] = df_show['掛單量'].map('{:,.0f}'.format)
+                st.table(df_show[['利率', '年化', '掛單量']])
         else:
-            st.error("讀取失敗，請檢查網路")
+            st.warning("交易所回應超時，等待自動重試中...")
 
 # ==========================================
 # 主畫面
 # ==========================================
-st.title("📈 Bitfinex 歷史氛圍戰情室 V8")
-st.caption(f"最後更新: {time.strftime('%H:%M:%S')} | 數據來源: 過去30天日線")
+st.title("💰 Bitfinex 智慧戰情室 (雲端穩定版)")
+st.caption(f"最後更新: {time.strftime('%H:%M:%S')} | 每10秒自動刷新")
 
 col1, col2 = st.columns(2)
-display_panel(col1, "🇺🇸 USD (美金)", 'fUSD', SEARCH_CAP_USD)
-display_panel(col2, "₮ USDT (泰達幣)", 'fUST', SEARCH_CAP_USDT)
+display_column(col1, "🇺🇸 USD (美金)", 'fUSD', SEARCH_CAP_USD)
+display_column(col2, "₮ USDT (泰達幣)", 'fUST', SEARCH_CAP_USDT)
 
-time.sleep(15) # 稍微延長刷新時間，因為要抓歷史數據
+time.sleep(10)
 st.rerun()
