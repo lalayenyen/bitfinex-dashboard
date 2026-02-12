@@ -4,16 +4,16 @@ import time
 import pandas as pd
 
 # ==========================================
-# 網頁設定
+# 設定區
 # ==========================================
-st.set_page_config(
-    page_title="Bitfinex 全能戰情室",
-    page_icon="💰",
-    layout="wide"
-)
+# 有效射程：我們只看前 300 萬美金的掛單 (這是大戶通常會掃單的範圍)
+SEARCH_CAP_USD = 3000000 
+SEARCH_CAP_USDT = 3000000
+
+st.set_page_config(page_title="Bitfinex 智慧戰情室", page_icon="💰", layout="wide")
 
 # ==========================================
-# 初始化與工具函式
+# 初始化
 # ==========================================
 @st.cache_resource
 def init_exchange():
@@ -23,7 +23,7 @@ bfx = init_exchange()
 
 def get_data(symbol):
     try:
-        # 抓掛單簿 (取前 100 檔以進行深度分析)
+        # 抓取掛單簿 (取前 100 檔，保證數據夠深)
         raw_book = bfx.public_get_book_symbol_precision({
             'symbol': symbol, 'precision': 'P0', 'len': 100
         })
@@ -41,121 +41,94 @@ def get_data(symbol):
     except:
         return [], 0
 
-def analyze_full_strategy(asks, frr):
+def analyze_smart_strategy(asks, frr, search_cap):
     if not asks: return None
     
     df = pd.DataFrame(asks)
-    total_vol = df['掛單量'].sum()
-    avg_vol = df['掛單量'].mean()
     
-    # --- 1. 尋找前三大資金牆 ---
-    # 依掛單量排序，取前三名
-    top_walls = df.nlargest(3, '掛單量').sort_values('利率')
+    # 1. 計算「累積掛單量」 (Cumulative Sum)
+    df['累積量'] = df['掛單量'].cumsum()
     
-    # --- 2. 三大策略分析 (理論值) ---
-    # A. 動態平均
-    rate_a = None
-    for index, row in df.iterrows():
-        if row['掛單量'] > avg_vol * 5:
-            rate_a = row['利率']
-            break
-            
-    # B. 深度累積
-    rate_b = None
-    cum = 0
-    for index, row in df.iterrows():
-        cum += row['掛單量']
-        if cum >= total_vol * 0.05:
-            rate_b = row['利率']
-            break
-            
-    # C. 心理關卡
-    rate_c = None
-    for index, row in df.iterrows():
-        r_test = row['利率'] * 10000
-        if abs(r_test - round(r_test)) < 0.05 and row['掛單量'] > avg_vol:
-            rate_c = row['利率']
-            break
-
-    # --- 3. 階梯掛單 (實戰值) ---
-    ladder_1 = frr
+    # 2. 計算年化報酬 (方便顯示)
+    df['年化'] = df['利率'] * 365
     
-    # 穩健單：找最大的牆
-    biggest_wall_rate = df.nlargest(1, '掛單量').iloc[0]['利率']
-    if biggest_wall_rate > frr:
-        ladder_2 = biggest_wall_rate - 0.00000001
-    else:
-        ladder_2 = frr * 1.1
+    # === 核心算法：尋找有效射程內的最佳牆 ===
+    # 篩選出累積量在「射程範圍 (Search Cap)」內的單
+    # 例如：只看前 300萬 USD，因為太遠的單通常吃不到
+    reachable_df = df[df['累積量'] <= search_cap]
+    
+    # 如果射程內沒單 (市場太淺)，就退而求其次用全部
+    if reachable_df.empty:
+        reachable_df = df.head(10)
         
-    ladder_3 = max(ladder_2 * 1.3, frr * 1.5)
+    # 在這個「吃得到的範圍」內，找最大的一根柱子
+    best_wall_idx = reachable_df['掛單量'].idxmax()
+    best_wall_row = reachable_df.loc[best_wall_idx]
+    
+    wall_rate = best_wall_row['利率']
+    
+    # 3. 設定策略價格
+    # 穩健單：掛在牆的前面一點點
+    if wall_rate > frr:
+        rec_rate = wall_rate - 0.00000001
+    else:
+        rec_rate = frr # 如果牆比 FRR 還低，就掛 FRR 保護自己
+        
+    # 釣魚單：射程外的高價區 (假設市場暴衝)
+    fish_rate = max(rec_rate * 1.3, frr * 1.5)
     
     return {
         'frr': frr,
-        'top_asks': df.head(5),
-        'top_walls': top_walls,
-        'strategies': {
-            'A.動態平均': rate_a,
-            'B.深度累積': rate_b,
-            'C.心理關卡': rate_c
-        },
-        'ladders': {
-            '1.保守 (30%)': ladder_1,
-            '2.穩健 (30%)': ladder_2,
-            '3.釣魚 (40%)': ladder_3
-        }
+        'rec_rate': rec_rate,
+        'fish_rate': fish_rate,
+        'wall_info': best_wall_row, # 記錄那道牆的資訊
+        'full_df': df, # 為了畫圖用
+        'reachable_df': reachable_df # 為了畫圖標示射程
     }
 
-def fmt_rate(r):
-    """將小數轉成百分比字串"""
-    if r is None: return "無訊號"
-    return f"{r*100:.4f}%"
-
-def display_currency_column(col, title, symbol):
+def display_panel(col, title, symbol, search_cap):
     with col:
         st.header(title)
         asks, frr = get_data(symbol)
         
         if asks:
-            res = analyze_full_strategy(asks, frr)
-            ladders = res['ladders']
+            res = analyze_smart_strategy(asks, frr, search_cap)
             
-            # --- 1. 關鍵指標 (階梯建議) ---
+            # --- 1. 關鍵指標 ---
             m1, m2, m3 = st.columns(3)
-            
-            # 顯示階梯式掛單建議
-            r1 = ladders['1.保守 (30%)']
-            r2 = ladders['2.穩健 (30%)']
-            r3 = ladders['3.釣魚 (40%)']
+            r1 = res['frr']
+            r2 = res['rec_rate']
+            r3 = res['fish_rate']
             
             m1.metric("1.保守 (FRR)", f"{r1*100:.4f}%", f"年化 {r1*36500:.1f}%")
-            m2.metric("2.穩健 (推薦)", f"{r2*100:.4f}%", f"年化 {r2*36500:.1f}%")
+            m2.metric("2.穩健 (智慧牆)", f"{r2*100:.4f}%", f"年化 {r2*36500:.1f}%")
             m3.metric("3.釣魚 (暴擊)", f"{r3*100:.4f}%", f"年化 {r3*36500:.1f}%")
             
+            st.info(f"💡 穩健策略分析：我們掃描了市場前 **{search_cap/10000:.0f}萬 USD** 的資金，發現最大阻力位在 **{res['wall_info']['利率']*100:.4f}%** (量體 {res['wall_info']['掛單量']:,.0f})，建議掛在它前面。")
+
             st.divider()
             
-            # --- 2. 市場分析三策略 ---
-            st.subheader("🔍 市場分析 (支撐位)")
-            strat_df = pd.DataFrame([
-                {"策略": k, "理論利率": fmt_rate(v), "狀態": "低於 FRR" if v and v < frr else "有效支撐"} 
-                for k, v in res['strategies'].items()
-            ])
-            st.dataframe(strat_df, use_container_width=True, hide_index=True)
+            # --- 2. 資金深度圖 (視覺化) ---
+            st.subheader("🌊 資金深度分佈圖")
             
-            # --- 3. 前三大資金牆 ---
-            st.subheader("🧱 前三大資金牆")
-            walls_df = res['top_walls'].copy()
-            walls_df['利率'] = walls_df['利率'].apply(fmt_rate)
-            walls_df['掛單量'] = walls_df['掛單量'].apply(lambda x: f"{x:,.0f}")
-            walls_df = walls_df[['利率', '掛單量']]
-            st.dataframe(walls_df, use_container_width=True, hide_index=True)
+            chart_data = res['full_df'].head(40).copy() # 只畫前40檔，不然太密
+            
+            # 為了讓圖表好讀，我們把利率當 X 軸 (字串化避免被當數值縮放)，掛單量當 Y 軸
+            # 並標記出哪一根是我們的「智慧牆」
+            chart_data['利率標籤'] = (chart_data['利率']*100).map('{:.4f}%'.format)
+            
+            # 使用 Streamlit 原生 Bar Chart
+            st.bar_chart(chart_data, x='利率標籤', y='掛單量', color='#00ff00')
+            st.caption("X軸: 利率 (低->高) | Y軸: 該價位的掛單量 (越高代表牆越厚)")
 
-            # --- 4. 掛單簿表格 ---
-            st.subheader("📊 掛單簿 Top 5")
-            display_df = res['top_asks'].copy()
-            display_df['年化報酬'] = (display_df['利率'] * 36500).map('{:.2f}%'.format)
-            display_df['利率'] = (display_df['利率'] * 100).map('{:.4f}%'.format)
-            display_df['掛單量'] = (display_df['掛單量']).map('{:,.0f}'.format)
-            st.table(display_df[['利率', '年化報酬', '掛單量']])
+            # --- 3. 掛單簿表格 ---
+            with st.expander("查看詳細掛單簿數據"):
+                display_df = res['full_df'].head(10).copy()
+                display_df['年化'] = display_df['年化'].map('{:.2f}%'.format)
+                display_df['利率'] = (display_df['利率']*100).map('{:.4f}%'.format)
+                display_df['掛單量'] = display_df['掛單量'].map('{:,.0f}'.format)
+                display_df['累積量'] = display_df['累積量'].map('{:,.0f}'.format)
+                st.table(display_df[['利率', '年化', '掛單量', '累積量']])
             
         else:
             st.error("讀取失敗")
@@ -163,12 +136,12 @@ def display_currency_column(col, title, symbol):
 # ==========================================
 # 主畫面
 # ==========================================
-st.title("💰 Bitfinex 全能戰情室 V6")
-st.caption(f"最後更新: {time.strftime('%H:%M:%S')} (每10秒刷新)")
+st.title("💰 Bitfinex 智慧戰情室 V7 (射程分析版)")
+st.caption(f"最後更新: {time.strftime('%H:%M:%S')} | 射程設定: 300萬 USD")
 
 col1, col2 = st.columns(2)
-display_currency_column(col1, "🇺🇸 USD (美金)", 'fUSD')
-display_currency_column(col2, "₮ USDT (泰達幣)", 'fUST')
+display_panel(col1, "🇺🇸 USD (美金)", 'fUSD', SEARCH_CAP_USD)
+display_panel(col2, "₮ USDT (泰達幣)", 'fUST', SEARCH_CAP_USDT)
 
 time.sleep(10)
 st.rerun()
