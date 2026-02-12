@@ -7,7 +7,7 @@ import pandas as pd
 # 設定區
 # ==========================================
 SEARCH_CAP = 3000000 
-st.set_page_config(page_title="Bitfinex 智慧戰情室 V8.2", page_icon="💰", layout="wide")
+st.set_page_config(page_title="Bitfinex 智慧戰情室 V8.3", page_icon="💰", layout="wide")
 
 @st.cache_resource
 def init_exchange():
@@ -22,10 +22,10 @@ def get_market_data(symbol):
         asks = [{'利率': float(item[0]), '掛單量': float(item[3])} for item in raw_book if float(item[3]) > 0]
         asks.sort(key=lambda x: x['利率'])
         
-        # 2. 抓 Ticker (修正負值問題)
+        # 2. 抓 Ticker (修正負值與顯示倍數問題)
         ticker = bfx.public_get_ticker_symbol({'symbol': symbol})
         # Bitfinex v2 Ticker: [FRR, BID, ..., 24H_HIGH, 24H_LOW]
-        # 確保取值正確，並使用 abs() 避免極少數異常負值顯示
+        # 注意：Bitfinex 原始數據是小數點格式 (如 0.0004)，不需要在抓取時乘 100
         frr = abs(float(ticker[0]))
         h24_high = abs(float(ticker[8]))
         h24_low = abs(float(ticker[9]))
@@ -73,7 +73,7 @@ def display_column(col, title, symbol):
         if asks:
             res = analyze_logic(asks, frr, h24_avg, h24_high)
             
-            # 1. 氛圍與指標
+            # 1. 氛圍與指標 (修正顯示倍數)
             st.markdown(f"""<div style="padding:15px; border-radius:10px; background-color:#f8f9fb; border-left: 5px solid {res['color']}; margin-bottom:20px;">
                 <h3 style="margin:0; color:{res['color']}">{res['sentiment']}</h3>
                 <code style="color:#666">和平基準: {res['h24_avg']*100:.4f}% | 24h最高: {res['h24_high']*100:.4f}%</code>
@@ -95,27 +95,31 @@ def display_column(col, title, symbol):
                 for _, r in res['top_walls'].iterrows():
                     st.write(f"🚩 {r['利率']*100:.4f}% ({r['掛單量']/1000:.1f}K)")
 
-            # 3. 圖表
+            # 3. 圖表 (修正畫法，避免 TypeError)
             st.subheader("🌊 資金深度分佈")
-            chart_df = res['full_df'].head(25).copy()
-            chart_df['利率標籤'] = (chart_df['利率']*100).map('{:.4f}%'.format)
-            st.bar_chart(chart_data=chart_df, x='利率標籤', y='掛單量', color='#00d4ff')
+            chart_df = res['full_df'].head(20).copy()
+            # 建立一個乾淨的繪圖用 DataFrame
+            plot_data = pd.DataFrame({
+                '利率(%)': chart_df['利率'] * 100,
+                '掛單量': chart_df['掛單量']
+            }).set_index('利率(%)')
+            st.bar_chart(plot_data, color='#00d4ff')
 
-            # 4. 找回詳細清單 (置底)
+            # 4. 詳細清單
             st.subheader("📊 詳細掛單清單 (Top 10)")
             list_df = res['full_df'].head(10).copy()
             list_df['年化'] = (list_df['利率']*36500).map('{:.2f}%'.format)
-            list_df['利率'] = (list_df['利率']*100).map('{:.4f}%'.format)
+            list_df['利率(%)'] = (list_df['利率']*100).map('{:.4f}%'.format)
             list_df['金額'] = list_df['掛單量'].map('{:,.0f}'.format)
-            st.table(list_df[['利率', '年化', '金額']])
+            st.table(list_df[['利率(%)', '年化', '金額']])
         else:
             st.warning("等待 API 回傳數據...")
 
 # ==========================================
 # 主介面
 # ==========================================
-st.title("💰 Bitfinex 智慧戰情室 V8.2")
-st.caption(f"最後更新: {time.strftime('%H:%M:%S')} | 修正負值與清單回歸")
+st.title("💰 Bitfinex 智慧戰情室 V8.3")
+st.caption(f"最後更新: {time.strftime('%H:%M:%S')} | 修復畫圖錯誤與負值")
 col_a, col_b = st.columns(2)
 display_column(col_a, "🇺🇸 USD (美金)", 'fUSD')
 display_column(col_b, "₮ USDT (泰達幣)", 'fUST')
