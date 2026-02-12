@@ -4,7 +4,7 @@ import time
 import pandas as pd
 
 # ==========================================
-# V9.7 修正版：徹底校正單位 + 強制渲染詳細清單
+# V9.7 修正版：徹底校正單位 + 強制渲染完整模塊
 # ==========================================
 st.set_page_config(page_title="Bitfinex 智慧戰情室 V9.7", page_icon="💰", layout="wide")
 
@@ -17,12 +17,13 @@ bfx = init_exchange()
 def get_hybrid_data(symbol):
     asks, frr, h24_avg, h24_high = [], 0, 0, 0
     try:
+        # 使用原始 API 獲取 Ticker
         ticker = bfx.public_get_ticker_symbol({'symbol': symbol})
         
-        # 強效校正單位：Bitfinex 日利率不可能超過 0.5% (年化 180%)
+        # 強效校正單位防呆
         def fix_unit(val):
             v = abs(float(val))
-            # 若數值大於 0.005，通常是 API 單位或欄位偏移，強制縮放
+            # 若數值 > 0.005 (日利率 0.5%)，通常是單位偏移或抓到成交量，自動縮放
             while v > 0.005: v /= 100 
             return v
 
@@ -33,6 +34,7 @@ def get_hybrid_data(symbol):
     except: pass
 
     try:
+        # 抓取掛單簿數據
         raw_book = bfx.public_get_book_symbol_precision({'symbol': symbol, 'precision': 'P0', 'len': 100})
         asks = [{'利率': float(item[0]), '掛單量': float(item[3])} for item in raw_book if float(item[3]) > 0]
         asks.sort(key=lambda x: x['利率'])
@@ -48,7 +50,7 @@ def display_column(col, title, symbol):
             df = pd.DataFrame(asks)
             df['累積量'] = df['掛單量'].cumsum()
             
-            # --- 1. 氛圍方塊 ---
+            # --- 1. 市場氛圍 ---
             color = "#09ab3b" if frr < h24_avg else "#ffa500"
             st.markdown(f"""<div style="padding:15px; border-radius:10px; background-color:#f8f9fb; border-left: 5px solid {color};">
                 <h3 style="margin:0; color:{color}">市場狀態分析</h3>
@@ -73,7 +75,7 @@ def display_column(col, title, symbol):
             chart_df['利率標籤'] = (chart_df['利率']*100).map('{:.4f}%'.format)
             st.bar_chart(chart_df.set_index('利率標籤')['掛單量'], color='#00d4ff')
 
-            # --- 5. 詳細清單 (確保渲染) ---
+            # --- 5. 詳細掛單清單 ---
             st.subheader("📊 詳細掛單清單 (Top 10)")
             list_df = df.head(10).copy()
             list_df['利率(%)'] = (list_df['利率']*100).map('{:.4f}%'.format)
@@ -81,10 +83,13 @@ def display_column(col, title, symbol):
             list_df['金額'] = list_df['掛單量'].map('{:,.0f}'.format)
             st.table(list_df[['利率(%)', '年化', '金額']])
         else:
-            st.warning("數據連接中...")
+            st.warning("數據讀取中...")
 
+# --- 主畫面佈局 ---
 st.title("💰 Bitfinex 智慧戰情室 V9.7")
 c1, c2 = st.columns(2)
 display_column(c1, "🇺🇸 USD (美金)", 'fUSD')
-display_column(col_b=c2, title="₮ USDT (泰達幣)", symbol='fUST')
-time.sleep(20); st.rerun()
+display_column(c2, "₮ USDT (泰達幣)", 'fUST') # 修正參數調用錯誤
+
+time.sleep(20)
+st.rerun()
