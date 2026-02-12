@@ -7,7 +7,7 @@ import pandas as pd
 # 網頁設定
 # ==========================================
 st.set_page_config(
-    page_title="Bitfinex 戰情室",
+    page_title="Bitfinex 全能戰情室",
     page_icon="💰",
     layout="wide"
 )
@@ -23,13 +23,12 @@ bfx = init_exchange()
 
 def get_data(symbol):
     try:
-        # 抓掛單簿 (取前 25 檔)
+        # 抓掛單簿 (取前 100 檔以進行深度分析)
         raw_book = bfx.public_get_book_symbol_precision({
-            'symbol': symbol, 'precision': 'P0', 'len': 25
+            'symbol': symbol, 'precision': 'P0', 'len': 100
         })
         asks = []
         for item in raw_book:
-            # item[3] > 0 代表是放貸方 (Asks)
             if float(item[3]) > 0:
                 asks.append({'利率': float(item[0]), '掛單量': float(item[3])})
         asks.sort(key=lambda x: x['利率'])
@@ -42,105 +41,134 @@ def get_data(symbol):
     except:
         return [], 0
 
-def analyze_strategy(asks, frr):
+def analyze_full_strategy(asks, frr):
     if not asks: return None
     
     df = pd.DataFrame(asks)
+    total_vol = df['掛單量'].sum()
+    avg_vol = df['掛單量'].mean()
     
-    # 策略計算
-    # 1. 穩健 (最大牆前一檔)
-    max_vol_idx = df['掛單量'].idxmax()
-    wall_rate = df.iloc[max_vol_idx]['利率']
+    # --- 1. 尋找前三大資金牆 ---
+    # 依掛單量排序，取前三名
+    top_walls = df.nlargest(3, '掛單量').sort_values('利率')
     
-    if wall_rate > frr:
-        rec_rate = wall_rate - 0.00000001
+    # --- 2. 三大策略分析 (理論值) ---
+    # A. 動態平均
+    rate_a = None
+    for index, row in df.iterrows():
+        if row['掛單量'] > avg_vol * 5:
+            rate_a = row['利率']
+            break
+            
+    # B. 深度累積
+    rate_b = None
+    cum = 0
+    for index, row in df.iterrows():
+        cum += row['掛單量']
+        if cum >= total_vol * 0.05:
+            rate_b = row['利率']
+            break
+            
+    # C. 心理關卡
+    rate_c = None
+    for index, row in df.iterrows():
+        r_test = row['利率'] * 10000
+        if abs(r_test - round(r_test)) < 0.05 and row['掛單量'] > avg_vol:
+            rate_c = row['利率']
+            break
+
+    # --- 3. 階梯掛單 (實戰值) ---
+    ladder_1 = frr
+    
+    # 穩健單：找最大的牆
+    biggest_wall_rate = df.nlargest(1, '掛單量').iloc[0]['利率']
+    if biggest_wall_rate > frr:
+        ladder_2 = biggest_wall_rate - 0.00000001
     else:
-        rec_rate = frr * 1.0001 # 稍微高一點點
+        ladder_2 = frr * 1.1
         
-    # 2. 釣魚
-    fish_rate = max(rec_rate * 1.3, frr * 1.5)
+    ladder_3 = max(ladder_2 * 1.3, frr * 1.5)
     
     return {
         'frr': frr,
-        'rec_rate': rec_rate,
-        'fish_rate': fish_rate,
-        'top_asks': df.head(5) # 取前5檔顯示
+        'top_asks': df.head(5),
+        'top_walls': top_walls,
+        'strategies': {
+            'A.動態平均': rate_a,
+            'B.深度累積': rate_b,
+            'C.心理關卡': rate_c
+        },
+        'ladders': {
+            '1.保守 (30%)': ladder_1,
+            '2.穩健 (30%)': ladder_2,
+            '3.釣魚 (40%)': ladder_3
+        }
     }
 
+def fmt_rate(r):
+    """將小數轉成百分比字串"""
+    if r is None: return "無訊號"
+    return f"{r*100:.4f}%"
+
 def display_currency_column(col, title, symbol):
-    """ 顯示單一幣種的欄位邏輯 (封裝起來讓程式碼更乾淨) """
     with col:
         st.header(title)
         asks, frr = get_data(symbol)
         
         if asks:
-            res = analyze_strategy(asks, frr)
+            res = analyze_full_strategy(asks, frr)
+            ladders = res['ladders']
             
-            # --- 1. 顯示關鍵指標 (加入年化顯示) ---
+            # --- 1. 關鍵指標 (階梯建議) ---
             m1, m2, m3 = st.columns(3)
             
-            # FRR
-            frr_daily = res['frr'] * 100
-            frr_year = res['frr'] * 365 * 100
-            m1.metric("基準 FRR", f"{frr_daily:.4f}%", f"年化 {frr_year:.1f}%")
+            # 顯示階梯式掛單建議
+            r1 = ladders['1.保守 (30%)']
+            r2 = ladders['2.穩健 (30%)']
+            r3 = ladders['3.釣魚 (40%)']
             
-            # 穩健掛單
-            rec_daily = res['rec_rate'] * 100
-            rec_year = res['rec_rate'] * 365 * 100
-            m2.metric("穩健掛單 (推薦)", f"{rec_daily:.4f}%", f"年化 {rec_year:.1f}%")
-            
-            # 釣魚掛單
-            fish_daily = res['fish_rate'] * 100
-            fish_year = res['fish_rate'] * 365 * 100
-            m3.metric("釣魚掛單 (暴擊)", f"{fish_daily:.4f}%", f"年化 {fish_year:.1f}%")
+            m1.metric("1.保守 (FRR)", f"{r1*100:.4f}%", f"年化 {r1*36500:.1f}%")
+            m2.metric("2.穩健 (推薦)", f"{r2*100:.4f}%", f"年化 {r2*36500:.1f}%")
+            m3.metric("3.釣魚 (暴擊)", f"{r3*100:.4f}%", f"年化 {r3*36500:.1f}%")
             
             st.divider()
             
-            # --- 2. 顯示掛單簿表格 (加入年化欄位) ---
-            st.subheader("📊 市場掛單簿 (Top 5)")
+            # --- 2. 市場分析三策略 ---
+            st.subheader("🔍 市場分析 (支撐位)")
+            strat_df = pd.DataFrame([
+                {"策略": k, "理論利率": fmt_rate(v), "狀態": "低於 FRR" if v and v < frr else "有效支撐"} 
+                for k, v in res['strategies'].items()
+            ])
+            st.dataframe(strat_df, use_container_width=True, hide_index=True)
             
-            # 複製一份資料來做格式化，不影響原始計算
+            # --- 3. 前三大資金牆 ---
+            st.subheader("🧱 前三大資金牆")
+            walls_df = res['top_walls'].copy()
+            walls_df['利率'] = walls_df['利率'].apply(fmt_rate)
+            walls_df['掛單量'] = walls_df['掛單量'].apply(lambda x: f"{x:,.0f}")
+            walls_df = walls_df[['利率', '掛單量']]
+            st.dataframe(walls_df, use_container_width=True, hide_index=True)
+
+            # --- 4. 掛單簿表格 ---
+            st.subheader("📊 掛單簿 Top 5")
             display_df = res['top_asks'].copy()
-            
-            # 新增「年化報酬」欄位 (日利率 * 365)
-            display_df['年化報酬'] = display_df['利率'] * 365
-            
-            # 格式化顯示 (轉成漂亮的字串)
-            # 利率: 0.0123%
-            display_df['利率 (日)'] = (display_df['利率'] * 100).map('{:.4f}%'.format)
-            
-            # 年化: 4.50%
-            display_df['年化報酬'] = (display_df['年化報酬'] * 100).map('{:.2f}%'.format)
-            
-            # 掛單量: 1,234
-            display_df['掛單量 (USD)'] = (display_df['掛單量']).map('{:,.0f}'.format)
-            
-            # 選取要顯示的欄位並排序
-            final_table = display_df[['利率 (日)', '年化報酬', '掛單量 (USD)']]
-            
-            # 顯示表格 (use_container_width=True 讓表格填滿欄位)
-            st.table(final_table)
+            display_df['年化報酬'] = (display_df['利率'] * 36500).map('{:.2f}%'.format)
+            display_df['利率'] = (display_df['利率'] * 100).map('{:.4f}%'.format)
+            display_df['掛單量'] = (display_df['掛單量']).map('{:,.0f}'.format)
+            st.table(display_df[['利率', '年化報酬', '掛單量']])
             
         else:
-            st.error("讀取失敗，請檢查網路連線")
+            st.error("讀取失敗")
 
 # ==========================================
-# 主畫面顯示
+# 主畫面
 # ==========================================
-st.title("💰 Bitfinex 資金戰情室 (Web版)")
-st.caption(f"最後更新時間: {time.strftime('%H:%M:%S')} (每10秒自動刷新)")
+st.title("💰 Bitfinex 全能戰情室 V6")
+st.caption(f"最後更新: {time.strftime('%H:%M:%S')} (每10秒刷新)")
 
-# 建立左右兩欄
 col1, col2 = st.columns(2)
-
-# 左欄顯示 USD
 display_currency_column(col1, "🇺🇸 USD (美金)", 'fUSD')
-
-# 右欄顯示 USDT
 display_currency_column(col2, "₮ USDT (泰達幣)", 'fUST')
 
-# ==========================================
-# 自動刷新機制
-# ==========================================
 time.sleep(10)
 st.rerun()
